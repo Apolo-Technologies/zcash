@@ -44,14 +44,13 @@ public:
     // Actions
     std::string strComment;
     std::string strStatusBar;
-    std::string strReserved;
+    std::string strRPCError;
 
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(this->nVersion);
-        nVersion = this->nVersion;
         READWRITE(nRelayUntil);
         READWRITE(nExpiration);
         READWRITE(nID);
@@ -64,7 +63,7 @@ public:
 
         READWRITE(LIMITED_STRING(strComment, 65536));
         READWRITE(LIMITED_STRING(strStatusBar, 256));
-        READWRITE(LIMITED_STRING(strReserved, 256));
+        READWRITE(LIMITED_STRING(strRPCError, 256));
     }
 
     void SetNull();
@@ -87,7 +86,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(vchMsg);
         READWRITE(vchSig);
     }
@@ -97,7 +96,7 @@ public:
     uint256 GetHash() const;
     bool IsInEffect() const;
     bool Cancels(const CAlert& alert) const;
-    bool AppliesTo(int nVersion, std::string strSubVerIn) const;
+    bool AppliesTo(int nVersion, const std::string& strSubVerIn) const;
     bool AppliesToMe() const;
     bool RelayTo(CNode* pnode) const;
     bool CheckSignature(const std::vector<unsigned char>& alertKey) const;

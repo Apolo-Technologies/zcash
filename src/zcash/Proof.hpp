@@ -1,5 +1,5 @@
-#ifndef _ZCPROOF_H_
-#define _ZCPROOF_H_
+#ifndef ZC_PROOF_H_
+#define ZC_PROOF_H_
 
 #include "serialize.h"
 #include "uint256.h"
@@ -25,7 +25,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(data);
     }
 
@@ -58,7 +58,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(data);
     }
 
@@ -93,7 +93,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         unsigned char leadingByte = G1_PREFIX_MASK;
 
         if (y_lsb) {
@@ -143,7 +143,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         unsigned char leadingByte = G2_PREFIX_MASK;
 
         if (y_gt) {
@@ -204,7 +204,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(g_A);
         READWRITE(g_A_prime);
         READWRITE(g_B);
@@ -235,7 +235,43 @@ public:
     }
 };
 
+void initialize_curve_params();
+
+class ProofVerifier {
+private:
+    bool perform_verification;
+
+    ProofVerifier(bool perform_verification) : perform_verification(perform_verification) { }
+
+public:
+    // ProofVerifier should never be copied
+    ProofVerifier(const ProofVerifier&) = delete;
+    ProofVerifier& operator=(const ProofVerifier&) = delete;
+    ProofVerifier(ProofVerifier&&);
+    ProofVerifier& operator=(ProofVerifier&&);
+
+    // Creates a verification context that strictly verifies
+    // all proofs using libsnark's API.
+    static ProofVerifier Strict();
+
+    // Creates a verification context that performs no
+    // verification, used when avoiding duplicate effort
+    // such as during reindexing.
+    static ProofVerifier Disabled();
+
+    template <typename VerificationKey,
+              typename ProcessedVerificationKey,
+              typename PrimaryInput,
+              typename Proof
+              >
+    bool check(
+        const VerificationKey& vk,
+        const ProcessedVerificationKey& pvk,
+        const PrimaryInput& pi,
+        const Proof& p
+    );
+};
 
 }
 
-#endif // _ZCPROOF_H_
+#endif // ZC_PROOF_H_

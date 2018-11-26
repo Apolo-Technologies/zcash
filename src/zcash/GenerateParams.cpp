@@ -9,20 +9,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if(argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " provingKeyFileName verificationKeyFileName" << std::endl;
+    if(argc != 4) {
+        std::cerr << "Usage: " << argv[0] << " provingKeyFileName verificationKeyFileName r1csFileName" << std::endl;
         return 1;
     }
 
     std::string pkFile = argv[1];
     std::string vkFile = argv[2];
+    std::string r1csFile = argv[3];
 
-    auto p = ZCJoinSplit::Generate();
-
-    p->saveProvingKey(pkFile);
-    p->saveVerifyingKey(vkFile);
-
-    delete p;
+    ZCJoinSplit::Generate(r1csFile, vkFile, pkFile);
 
     return 0;
 }

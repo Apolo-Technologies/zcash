@@ -2,65 +2,190 @@
 
 set -eu
 
-PARAMS_DIR="$HOME/.zcash-params"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    PARAMS_DIR="$HOME/Library/Application Support/ZcashParams"
+else
+    PARAMS_DIR="$HOME/.zcash-params"
+fi
 
-REGTEST_PKEY_NAME='z9-proving.key'
-REGTEST_VKEY_NAME='z9-verifying.key'
-REGTEST_PKEY_URL="https://z.cash/downloads/$REGTEST_PKEY_NAME"
-REGTEST_VKEY_URL="https://z.cash/downloads/$REGTEST_VKEY_NAME"
-REGTEST_DIR="$PARAMS_DIR/regtest"
+SPROUT_PKEY_NAME='sprout-proving.key'
+SPROUT_VKEY_NAME='sprout-verifying.key'
+SAPLING_SPEND_NAME='sapling-spend-testnet.params'
+SAPLING_OUTPUT_NAME='sapling-output-testnet.params'
+SAPLING_SPROUT_GROTH16_NAME='sprout-groth16-testnet.params'
+SPROUT_URL="https://z.cash/downloads"
+SPROUT_IPFS="/ipfs/QmZKKx7Xup7LiAtFRhYsE1M7waXcv9ir9eCECyXAFGxhEo"
 
-# This should have the same params as regtest. We use symlinks for now.
-TESTNET3_DIR="$PARAMS_DIR/testnet3"
+SHA256CMD="$(command -v sha256sum || echo shasum)"
+SHA256ARGS="$(command -v sha256sum >/dev/null || echo '-a 256')"
 
+WGETCMD="$(command -v wget || echo '')"
+IPFSCMD="$(command -v ipfs || echo '')"
+CURLCMD="$(command -v curl || echo '')"
+
+# fetch methods can be disabled with ZC_DISABLE_SOMETHING=1
+ZC_DISABLE_WGET="${ZC_DISABLE_WGET:-}"
+ZC_DISABLE_IPFS="${ZC_DISABLE_IPFS:-}"
+ZC_DISABLE_CURL="${ZC_DISABLE_CURL:-}"
+
+function fetch_wget {
+    if [ -z "$WGETCMD" ] || ! [ -z "$ZC_DISABLE_WGET" ]; then
+        return 1
+    fi
+
+    local filename="$1"
+    local dlname="$2"
+
+    cat <<EOF
+
+Retrieving (wget): $SPROUT_URL/$filename
+EOF
+
+    wget \
+        --progress=dot:giga \
+        --output-document="$dlname" \
+        --continue \
+        --retry-connrefused --waitretry=3 --timeout=30 \
+        "$SPROUT_URL/$filename"
+}
+
+function fetch_ipfs {
+    if [ -z "$IPFSCMD" ] || ! [ -z "$ZC_DISABLE_IPFS" ]; then
+        return 1
+    fi
+
+    local filename="$1"
+    local dlname="$2"
+
+    cat <<EOF
+
+Retrieving (ipfs): $SPROUT_IPFS/$filename
+EOF
+
+    ipfs get --output "$dlname" "$SPROUT_IPFS/$filename"
+}
+
+function fetch_curl {
+    if [ -z "$CURLCMD" ] || ! [ -z "$ZC_DISABLE_CURL" ]; then
+        return 1
+    fi
+
+    local filename="$1"
+    local dlname="$2"
+
+    cat <<EOF
+
+Retrieving (curl): $SPROUT_URL/$filename
+EOF
+
+    curl \
+        --output "$dlname" \
+        -# -L -C - \
+        "$SPROUT_URL/$filename"
+
+}
+
+function fetch_failure {
+    cat >&2 <<EOF
+
+Failed to fetch the Zcash zkSNARK parameters!
+Try installing one of the following programs and make sure you're online:
+
+ * ipfs
+ * wget
+ * curl
+
+EOF
+    exit 1
+}
 
 function fetch_params {
-    local url="$1"
+    local filename="$1"
     local output="$2"
     local dlname="${output}.dl"
+    local expectedhash="$3"
 
     if ! [ -f "$output" ]
     then
-        echo "Retrieving: $url"
-        # Note: --no-check-certificate should be ok, since we rely on
-        # sha256 for integrity, and there's no confidentiality requirement.
-        # Our website uses letsencrypt certificates which are not supported
-        # by some wget installations, so we expect some cert failures.
-        wget \
-            --progress=dot:giga \
-            --no-check-certificate \
-            --output-document="$dlname" \
-            --continue \
-            "$url"
+        for method in wget ipfs curl failure; do
+            if "fetch_$method" "$filename" "$dlname"; then
+                echo "Download successful!"
+                break
+            fi
+        done
 
-        # Only after successful download do we update the parameter load path:
-        mv -v "$dlname" "$output"
+        "$SHA256CMD" $SHA256ARGS -c <<EOF
+$expectedhash  $dlname
+EOF
+
+        # Check the exit code of the shasum command:
+        CHECKSUM_RESULT=$?
+        if [ $CHECKSUM_RESULT -eq 0 ]; then
+            mv -v "$dlname" "$output"
+        else
+            echo "Failed to verify parameter checksums!" >&2
+            exit 1
+        fi
     fi
 }
 
-cat <<EOF
-zcash - fetch-params.sh
+# Use flock to prevent parallel execution.
+function lock() {
+    local lockfile=/tmp/fetch_params.lock
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        if shlock -f ${lockfile} -p $$; then
+            return 0
+        else
+            return 1
+        fi
+    else
+        # create lock file
+        eval "exec 200>/$lockfile"
+        # acquire the lock
+        flock -n 200 \
+            && return 0 \
+            || return 1
+    fi
+}
 
+function exit_locked_error {
+    echo "Only one instance of fetch-params.sh can be run at a time." >&2
+    exit 1
+}
+
+function main() {
+
+    lock fetch-params.sh \
+    || exit_locked_error
+
+    cat <<EOF
+Zcash - fetch-params.sh
+
+This script will fetch the Zcash zkSNARK parameters and verify their
+integrity with sha256sum.
+
+NOTE: If you're using testnet or regtest, you will need to invoke this
+script with --testnet in order to download additional parameters. This
+is temporary.
+
+If they already exist locally, it will exit now and do nothing else.
 EOF
 
-# Now create PARAMS_DIR and insert a README if necessary:
-if ! [ -d "$PARAMS_DIR" ]
-then
-    mkdir -p "$PARAMS_DIR"
-    README_PATH="$PARAMS_DIR/README"
-    cat >> "$README_PATH" <<EOF
-This directory stores common zcash zkSNARK parameters. Note that it is
+    # Now create PARAMS_DIR and insert a README if necessary:
+    if ! [ -d "$PARAMS_DIR" ]
+    then
+        mkdir -p "$PARAMS_DIR"
+        README_PATH="$PARAMS_DIR/README"
+        cat >> "$README_PATH" <<EOF
+This directory stores common Zcash zkSNARK parameters. Note that it is
 distinct from the daemon's -datadir argument because the parameters are
 large and may be shared across multiple distinct -datadir's such as when
 setting up test networks.
 EOF
 
-    # This may be the first time the user's run this script, so give
-    # them some info, especially about bandwidth usage:
-    cat <<EOF
-This script will fetch the Zcash zkSNARK parameters and verify their
-integrity with sha256sum.
-
+        # This may be the first time the user's run this script, so give
+        # them some info, especially about bandwidth usage:
+        cat <<EOF
 The parameters are currently just under 911MB in size, so plan accordingly
 for your bandwidth constraints. If the files are already present and
 have the correct sha256sum, no networking is used.
@@ -69,26 +194,22 @@ Creating params directory. For details about this directory, see:
 $README_PATH
 
 EOF
-fi
+    fi
 
-mkdir -p "$REGTEST_DIR"
+    cd "$PARAMS_DIR"
 
-fetch_params "$REGTEST_PKEY_URL" "$REGTEST_DIR/$REGTEST_PKEY_NAME"
-fetch_params "$REGTEST_VKEY_URL" "$REGTEST_DIR/$REGTEST_VKEY_NAME"
+    fetch_params "$SPROUT_PKEY_NAME" "$PARAMS_DIR/$SPROUT_PKEY_NAME" "8bc20a7f013b2b58970cddd2e7ea028975c88ae7ceb9259a5344a16bc2c0eef7"
+    fetch_params "$SPROUT_VKEY_NAME" "$PARAMS_DIR/$SPROUT_VKEY_NAME" "4bd498dae0aacfd8e98dc306338d017d9c08dd0918ead18172bd0aec2fc5df82"
 
-echo 'Updating testnet3 symlinks to regtest parameters.'
-mkdir -p "$TESTNET3_DIR"
-ln -sf "../regtest/$REGTEST_PKEY_NAME" "$TESTNET3_DIR/$REGTEST_PKEY_NAME"
-ln -sf "../regtest/$REGTEST_VKEY_NAME" "$TESTNET3_DIR/$REGTEST_VKEY_NAME"
+    if [ "x${1:-}" = 'x--testnet' ]
+    then
+        echo "(NOTE) Testnet parameters enabled."
+        fetch_params "$SAPLING_SPEND_NAME" "$PARAMS_DIR/$SAPLING_SPEND_NAME" "0ed6e26abae38daa80405b44da73af4fda2a9cacdaa3d20da4e81acdce43b7d1"
+        fetch_params "$SAPLING_OUTPUT_NAME" "$PARAMS_DIR/$SAPLING_OUTPUT_NAME" "fd36323771e3d3a63289fb7cedc9e41508bd0ae5053eb760340cc4e75d5b5805"
+        fetch_params "$SAPLING_SPROUT_GROTH16_NAME" "$PARAMS_DIR/$SAPLING_SPROUT_GROTH16_NAME" "7bae010c761ce11f149466aec6c50a7a2264076b6a75f352d9f60268c1d778b9"
+    fi
+}
 
-cd "$PARAMS_DIR"
-
-# Now verify their hashes:
-echo 'Verifying parameter file integrity via sha256sum...'
-shasum -a 256 --check <<EOF
-226913bbdc48b70834f8e044d194ddb61c8e15329f67cdc6014f4e5ac11a82ab  regtest/$REGTEST_PKEY_NAME
-226913bbdc48b70834f8e044d194ddb61c8e15329f67cdc6014f4e5ac11a82ab  testnet3/$REGTEST_PKEY_NAME
-4c151c562fce2cdee55ac0a0f8bd9454eb69e6a0db9a8443b58b770ec29b37f5  regtest/$REGTEST_VKEY_NAME
-4c151c562fce2cdee55ac0a0f8bd9454eb69e6a0db9a8443b58b770ec29b37f5  testnet3/$REGTEST_VKEY_NAME
-EOF
-
+main ${1:-}
+rm -f /tmp/fetch_params.lock
+exit 0

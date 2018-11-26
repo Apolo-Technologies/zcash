@@ -8,13 +8,14 @@
 
 #include "amount.h"
 #include "coins.h"
-#include "consensus/consensus.h"
 #include "key.h"
 #include "keystore.h"
+#include "main.h"
 #include "primitives/block.h"
 #include "primitives/transaction.h"
 #include "tinyformat.h"
 #include "ui_interface.h"
+#include "util.h"
 #include "utilstrencodings.h"
 #include "validationinterface.h"
 #include "wallet/crypter.h"
@@ -57,9 +58,8 @@ static const unsigned int MAX_FREE_TRANSACTION_CREATE_SIZE = 1000;
 //! Size of witness cache
 //  Should be large enough that we can expect not to reorg beyond our cache
 //  unless there is some exceptional network disruption.
-static const unsigned int WITNESS_CACHE_SIZE = COINBASE_MATURITY;
+static const unsigned int WITNESS_CACHE_SIZE = MAX_REORG_LENGTH + 1;
 
-class CAccountingEntry;
 class CBlockIndex;
 class CCoinControl;
 class COutput;
@@ -93,8 +93,9 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
-        if (!(nType & SER_GETHASH))
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        int nVersion = s.GetVersion();
+        if (!(s.GetType() & SER_GETHASH))
             READWRITE(nVersion);
         READWRITE(nTime);
         READWRITE(vchPubKey);
@@ -152,14 +153,14 @@ struct COutputEntry
     int vout;
 };
 
-/** An note outpoint */
+/** A note outpoint */
 class JSOutPoint
 {
 public:
     // Transaction hash
     uint256 hash;
     // Index into CTransaction.vjoinsplit
-    size_t js;
+    uint64_t js;
     // Index into JSDescription fields of length ZC_NUM_JS_OUTPUTS
     uint8_t n;
 
@@ -169,7 +170,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(hash);
         READWRITE(js);
         READWRITE(n);
@@ -200,12 +201,19 @@ class CNoteData
 public:
     libzcash::PaymentAddress address;
 
-    // It's okay to cache the nullifier in the wallet, because we are storing
-    // the spending key there too, which could be used to derive this.
-    // If PR #1210 is merged, we need to revisit the threat model and decide
-    // whether it is okay to store this unencrypted while the spending key is
-    // encrypted.
-    uint256 nullifier;
+    /**
+     * Cached note nullifier. May not be set if the wallet was not unlocked when
+     * this was CNoteData was created. If not set, we always assume that the
+     * note has not been spent.
+     *
+     * It's okay to cache the nullifier in the wallet, because we are storing
+     * the spending key there too, which could be used to derive this.
+     * If the wallet is encrypted, this means that someone with access to the
+     * locked wallet cannot spend notes, but can connect received notes to the
+     * transactions they are spent in. This is the same security semantics as
+     * for transparent addresses.
+     */
+    boost::optional<uint256> nullifier;
 
     /**
      * Cached incremental witnesses for spendable Notes.
@@ -213,16 +221,31 @@ public:
      */
     std::list<ZCIncrementalWitness> witnesses;
 
-    CNoteData() : address(), nullifier() { }
-    CNoteData(libzcash::PaymentAddress a, uint256 n) : address {a}, nullifier {n} { }
+    /**
+     * Block height corresponding to the most current witness.
+     *
+     * When we first create a CNoteData in CWallet::FindMyNotes, this is set to
+     * -1 as a placeholder. The next time CWallet::ChainTip is called, we can
+     * determine what height the witness cache for this note is valid for (even
+     * if no witnesses were cached), and so can set the correct value in
+     * CWallet::IncrementNoteWitnesses and CWallet::DecrementNoteWitnesses.
+     */
+    int witnessHeight;
+
+    CNoteData() : address(), nullifier(), witnessHeight {-1} { }
+    CNoteData(libzcash::PaymentAddress a) :
+            address {a}, nullifier(), witnessHeight {-1} { }
+    CNoteData(libzcash::PaymentAddress a, uint256 n) :
+            address {a}, nullifier {n}, witnessHeight {-1} { }
 
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(address);
         READWRITE(nullifier);
         READWRITE(witnesses);
+        READWRITE(witnessHeight);
     }
 
     friend bool operator<(const CNoteData& a, const CNoteData& b) {
@@ -241,14 +264,21 @@ public:
 
 typedef std::map<JSOutPoint, CNoteData> mapNoteData_t;
 
-
+/** Decrypted note and its location in a transaction. */
 struct CNotePlaintextEntry
 {
     JSOutPoint jsop;
+    libzcash::PaymentAddress address;
     libzcash::NotePlaintext plaintext;
 };
 
-
+/** Decrypted note, location in a transaction, and confirmation height. */
+struct CUnspentNotePlaintextEntry {
+    JSOutPoint jsop;
+    libzcash::PaymentAddress address;
+    libzcash::NotePlaintext plaintext;
+    int nHeight;
+};
 
 /** A transaction with a merkle branch linking it to the block chain. */
 class CMerkleTx : public CTransaction
@@ -285,9 +315,8 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(*(CTransaction*)this);
-        nVersion = this->nVersion;
         READWRITE(hashBlock);
         READWRITE(vMerkleBranch);
         READWRITE(nIndex);
@@ -404,7 +433,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         if (ser_action.ForRead())
             Init(NULL);
         char fSpent = false;
@@ -537,8 +566,9 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
-        if (!(nType & SER_GETHASH))
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        int nVersion = s.GetVersion();
+        if (!(s.GetType() & SER_GETHASH))
             READWRITE(nVersion);
         READWRITE(vchPrivKey);
         READWRITE(nTimeCreated);
@@ -547,6 +577,87 @@ public:
     }
 };
 
+/**
+ * Internal transfers.
+ * Database key is acentry<account><counter>.
+ */
+class CAccountingEntry
+{
+public:
+    std::string strAccount;
+    CAmount nCreditDebit;
+    int64_t nTime;
+    std::string strOtherAccount;
+    std::string strComment;
+    mapValue_t mapValue;
+    int64_t nOrderPos;  //! position in ordered transaction list
+    uint64_t nEntryNo;
+
+    CAccountingEntry()
+    {
+        SetNull();
+    }
+
+    void SetNull()
+    {
+        nCreditDebit = 0;
+        nTime = 0;
+        strAccount.clear();
+        strOtherAccount.clear();
+        strComment.clear();
+        nOrderPos = -1;
+        nEntryNo = 0;
+    }
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        int nVersion = s.GetVersion();
+        if (!(s.GetType() & SER_GETHASH))
+            READWRITE(nVersion);
+        //! Note: strAccount is serialized as part of the key, not here.
+        READWRITE(nCreditDebit);
+        READWRITE(nTime);
+        READWRITE(LIMITED_STRING(strOtherAccount, 65536));
+
+        if (!ser_action.ForRead())
+        {
+            WriteOrderPos(nOrderPos, mapValue);
+
+            if (!(mapValue.empty() && _ssExtra.empty()))
+            {
+                CDataStream ss(s.GetType(), s.GetVersion());
+                ss.insert(ss.begin(), '\0');
+                ss << mapValue;
+                ss.insert(ss.end(), _ssExtra.begin(), _ssExtra.end());
+                strComment.append(ss.str());
+            }
+        }
+
+        READWRITE(LIMITED_STRING(strComment, 65536));
+
+        size_t nSepPos = strComment.find("\0", 0, 1);
+        if (ser_action.ForRead())
+        {
+            mapValue.clear();
+            if (std::string::npos != nSepPos)
+            {
+                CDataStream ss(std::vector<char>(strComment.begin() + nSepPos + 1, strComment.end()), s.GetType(), s.GetVersion());
+                ss >> mapValue;
+                _ssExtra = std::vector<char>(ss.begin(), ss.end());
+            }
+            ReadOrderPos(nOrderPos, mapValue);
+        }
+        if (std::string::npos != nSepPos)
+            strComment.erase(nSepPos);
+
+        mapValue.erase("n");
+    }
+
+private:
+    std::vector<char> _ssExtra;
+};
 
 
 /** 
@@ -556,7 +667,7 @@ public:
 class CWallet : public CCryptoKeyStore, public CValidationInterface
 {
 private:
-    bool SelectCoins(const CAmount& nTargetValue, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, CAmount& nValueRet, const CCoinControl *coinControl = NULL) const;
+    bool SelectCoins(const CAmount& nTargetValue, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, CAmount& nValueRet, bool& fOnlyCoinbaseCoinsRet, bool& fNeedCoinbaseCoinsRet, const CCoinControl *coinControl = NULL) const;
 
     CWalletDB *pwalletdbEncryption;
 
@@ -598,11 +709,58 @@ public:
      */
     int64_t nWitnessCacheSize;
 
+    void ClearNoteWitnessCache();
+
 protected:
+    /**
+     * pindex is the new tip being connected.
+     */
     void IncrementNoteWitnesses(const CBlockIndex* pindex,
                                 const CBlock* pblock,
-                                ZCIncrementalMerkleTree tree);
-    void DecrementNoteWitnesses();
+                                ZCIncrementalMerkleTree& tree);
+    /**
+     * pindex is the old tip being disconnected.
+     */
+    void DecrementNoteWitnesses(const CBlockIndex* pindex);
+
+    template <typename WalletDB>
+    void SetBestChainINTERNAL(WalletDB& walletdb, const CBlockLocator& loc) {
+        if (!walletdb.TxnBegin()) {
+            // This needs to be done atomically, so don't do it at all
+            LogPrintf("SetBestChain(): Couldn't start atomic write\n");
+            return;
+        }
+        try {
+            for (std::pair<const uint256, CWalletTx>& wtxItem : mapWallet) {
+                if (!walletdb.WriteTx(wtxItem.first, wtxItem.second)) {
+                    LogPrintf("SetBestChain(): Failed to write CWalletTx, aborting atomic write\n");
+                    walletdb.TxnAbort();
+                    return;
+                }
+            }
+            if (!walletdb.WriteWitnessCacheSize(nWitnessCacheSize)) {
+                LogPrintf("SetBestChain(): Failed to write nWitnessCacheSize, aborting atomic write\n");
+                walletdb.TxnAbort();
+                return;
+            }
+            if (!walletdb.WriteBestBlock(loc)) {
+                LogPrintf("SetBestChain(): Failed to write best block, aborting atomic write\n");
+                walletdb.TxnAbort();
+                return;
+            }
+        } catch (const std::exception &exc) {
+            // Unexpected failure
+            LogPrintf("SetBestChain(): Unexpected error during atomic write:\n");
+            LogPrintf("%s\n", exc.what());
+            walletdb.TxnAbort();
+            return;
+        }
+        if (!walletdb.TxnCommit()) {
+            // Couldn't commit all to db, but in-memory state is fine
+            LogPrintf("SetBestChain(): Couldn't commit atomic write\n");
+            return;
+        }
+    }
 
 private:
     template <class T>
@@ -638,7 +796,7 @@ public:
         SetNull();
     }
 
-    CWallet(std::string strWalletFileIn)
+    CWallet(const std::string& strWalletFileIn)
     {
         SetNull();
 
@@ -667,7 +825,56 @@ public:
         nWitnessCacheSize = 0;
     }
 
+    /**
+     * The reverse mapping of nullifiers to notes.
+     *
+     * The mapping cannot be updated while an encrypted wallet is locked,
+     * because we need the SpendingKey to create the nullifier (#1502). This has
+     * several implications for transactions added to the wallet while locked:
+     *
+     * - Parent transactions can't be marked dirty when a child transaction that
+     *   spends their output notes is updated.
+     *
+     *   - We currently don't cache any note values, so this is not a problem,
+     *     yet.
+     *
+     * - GetFilteredNotes can't filter out spent notes.
+     *
+     *   - Per the comment in CNoteData, we assume that if we don't have a
+     *     cached nullifier, the note is not spent.
+     *
+     * Another more problematic implication is that the wallet can fail to
+     * detect transactions on the blockchain that spend our notes. There are two
+     * possible cases in which this could happen:
+     *
+     * - We receive a note when the wallet is locked, and then spend it using a
+     *   different wallet client.
+     *
+     * - We spend from a PaymentAddress we control, then we export the
+     *   SpendingKey and import it into a new wallet, and reindex/rescan to find
+     *   the old transactions.
+     *
+     * The wallet will only miss "pure" spends - transactions that are only
+     * linked to us by the fact that they contain notes we spent. If it also
+     * sends notes to us, or interacts with our transparent addresses, we will
+     * detect the transaction and add it to the wallet (again without caching
+     * nullifiers for new notes). As by default JoinSplits send change back to
+     * the origin PaymentAddress, the wallet should rarely miss transactions.
+     *
+     * To work around these issues, whenever the wallet is unlocked, we scan all
+     * cached notes, and cache any missing nullifiers. Since the wallet must be
+     * unlocked in order to spend notes, this means that GetFilteredNotes will
+     * always behave correctly within that context (and any other uses will give
+     * correct responses afterwards), for the transactions that the wallet was
+     * able to detect. Any missing transactions can be rediscovered by:
+     *
+     * - Unlocking the wallet (to fill all nullifier caches).
+     *
+     * - Restarting the node with -reindex (which operates on a locked wallet
+     *   but with the now-cached nullifiers).
+     */
     std::map<uint256, JSOutPoint> mapNullifiersToNotes;
+
     std::map<uint256, CWalletTx> mapWallet;
 
     int64_t nOrderPosNext;
@@ -678,6 +885,7 @@ public:
     CPubKey vchDefaultKey;
 
     std::set<COutPoint> setLockedCoins;
+    std::set<JSOutPoint> setLockedNotes;
 
     int64_t nTimeFirstKey;
 
@@ -686,7 +894,7 @@ public:
     //! check whether we are allowed to upgrade (or already support) to the named feature
     bool CanSupportFeature(enum WalletFeature wf) { AssertLockHeld(cs_wallet); return nWalletMaxVersion >= wf; }
 
-    void AvailableCoins(std::vector<COutput>& vCoins, bool fOnlyConfirmed=true, const CCoinControl *coinControl = NULL, bool fIncludeZeroValue=false) const;
+    void AvailableCoins(std::vector<COutput>& vCoins, bool fOnlyConfirmed=true, const CCoinControl *coinControl = NULL, bool fIncludeZeroValue=false, bool fIncludeCoinBase=true) const;
     bool SelectCoinsMinConf(const CAmount& nTargetValue, int nConfMine, int nConfTheirs, std::vector<COutput> vCoins, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, CAmount& nValueRet) const;
 
     bool IsSpent(const uint256& hash, unsigned int n) const;
@@ -697,6 +905,14 @@ public:
     void UnlockCoin(COutPoint& output);
     void UnlockAllCoins();
     void ListLockedCoins(std::vector<COutPoint>& vOutpts);
+
+
+    bool IsLockedNote(uint256 hash, size_t js, uint8_t n) const;
+    void LockNote(JSOutPoint& output);
+    void UnlockNote(JSOutPoint& output);
+    void UnlockAllNotes();
+    std::vector<JSOutPoint> ListLockedNotes();
+
 
     /**
      * keystore implementation
@@ -751,7 +967,16 @@ public:
     bool LoadZKey(const libzcash::SpendingKey &key);
     //! Load spending key metadata (used by LoadWallet)
     bool LoadZKeyMetadata(const libzcash::PaymentAddress &addr, const CKeyMetadata &meta);
+    //! Adds an encrypted spending key to the store, without saving it to disk (used by LoadWallet)
+    bool LoadCryptedZKey(const libzcash::PaymentAddress &addr, const libzcash::ReceivingKey &rk, const std::vector<unsigned char> &vchCryptedSecret);
+    //! Adds an encrypted spending key to the store, and saves it to disk (virtual method, declared in crypter.h)
+    bool AddCryptedSpendingKey(const libzcash::PaymentAddress &address, const libzcash::ReceivingKey &rk, const std::vector<unsigned char> &vchCryptedSecret);
 
+    //! Adds a viewing key to the store, and saves it to disk.
+    bool AddViewingKey(const libzcash::ViewingKey &vk);
+    bool RemoveViewingKey(const libzcash::ViewingKey &vk);
+    //! Adds a viewing key to the store, without saving it to disk (used by LoadWallet)
+    bool LoadViewingKey(const libzcash::ViewingKey &dest);
 
     /** 
      * Increment the next transaction order id
@@ -770,7 +995,8 @@ public:
     TxItems OrderedTxItems(std::list<CAccountingEntry>& acentries, std::string strAccount = "");
 
     void MarkDirty();
-    void UpdateNullifierNoteMap(const CWalletTx& wtx);
+    bool UpdateNullifierNoteMap();
+    void UpdateNullifierNoteMapWithTx(const CWalletTx& wtx);
     bool AddToWallet(const CWalletTx& wtxIn, bool fFromLoadWallet, CWalletDB* pwalletdb);
     void SyncTransaction(const CTransaction& tx, const CBlock* pblock);
     bool AddToWalletIfInvolvingMe(const CTransaction& tx, const CBlock* pblock, bool fUpdate);
@@ -789,8 +1015,9 @@ public:
     CAmount GetWatchOnlyBalance() const;
     CAmount GetUnconfirmedWatchOnlyBalance() const;
     CAmount GetImmatureWatchOnlyBalance() const;
-    bool CreateTransaction(const std::vector<CRecipient>& vecSend,
-                           CWalletTx& wtxNew, CReserveKey& reservekey, CAmount& nFeeRet, int& nChangePosRet, std::string& strFailReason, const CCoinControl *coinControl = NULL);
+    bool FundTransaction(CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosRet, std::string& strFailReason);
+    bool CreateTransaction(const std::vector<CRecipient>& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, CAmount& nFeeRet, int& nChangePosRet,
+                           std::string& strFailReason, const CCoinControl *coinControl = NULL, bool sign = true);
     bool CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey);
 
     static CFeeRate minTxFee;
@@ -808,8 +1035,14 @@ public:
     std::set< std::set<CTxDestination> > GetAddressGroupings();
     std::map<CTxDestination, CAmount> GetAddressBalances();
 
-    std::set<CTxDestination> GetAccountAddresses(std::string strAccount) const;
+    std::set<CTxDestination> GetAccountAddresses(const std::string& strAccount) const;
 
+    boost::optional<uint256> GetNoteNullifier(
+        const JSDescription& jsdesc,
+        const libzcash::PaymentAddress& address,
+        const ZCNoteDecryption& dec,
+        const uint256& hSig,
+        uint8_t n) const;
     mapNoteData_t FindMyNotes(const CTransaction& tx) const;
     bool IsFromMe(const uint256& nullifier) const;
     void GetNoteWitnesses(
@@ -830,6 +1063,7 @@ public:
     CAmount GetCredit(const CTransaction& tx, const isminefilter& filter) const;
     CAmount GetChange(const CTransaction& tx) const;
     void ChainTip(const CBlockIndex *pindex, const CBlock *pblock, ZCIncrementalMerkleTree tree, bool added);
+    /** Saves witness caches and best block locator to disk. */
     void SetBestChain(const CBlockLocator& loc);
 
     DBErrors LoadWallet(bool& fFirstRunRet);
@@ -905,8 +1139,25 @@ public:
     void SetBroadcastTransactions(bool broadcast) { fBroadcastTransactions = broadcast; }
     
     /* Find notes filtered by payment address, min depth, ability to spend */
-    bool GetFilteredNotes(std::vector<CNotePlaintextEntry> & outEntries, std::string address, size_t minDepth, bool ignoreSpent=true);
+    void GetFilteredNotes(std::vector<CNotePlaintextEntry> & outEntries,
+                          std::string address,
+                          int minDepth=1,
+                          bool ignoreSpent=true,
+                          bool ignoreUnspendable=true);
+
+    /* Find notes filtered by payment addresses, min depth, ability to spend */
+    void GetFilteredNotes(std::vector<CNotePlaintextEntry>& outEntries,
+                          std::set<libzcash::PaymentAddress>& filterAddresses,
+                          int minDepth=1,
+                          bool ignoreSpent=true,
+                          bool ignoreUnspendable=true);
     
+    /* Find unspent notes filtered by payment address, min depth and max depth */
+    void GetUnspentFilteredNotes(std::vector<CUnspentNotePlaintextEntry>& outEntries,
+                                 std::set<libzcash::PaymentAddress>& filterAddresses,
+                                 int minDepth=1,
+                                 int maxDepth=INT_MAX,
+                                 bool requireSpendingKey=true);
 };
 
 /** A key allocated from the key pool. */
@@ -929,7 +1180,7 @@ public:
     }
 
     void ReturnKey();
-    bool GetReservedKey(CPubKey &pubkey);
+    virtual bool GetReservedKey(CPubKey &pubkey);
     void KeepKey();
 };
 
@@ -956,94 +1207,12 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
-        if (!(nType & SER_GETHASH))
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        int nVersion = s.GetVersion();
+        if (!(s.GetType() & SER_GETHASH))
             READWRITE(nVersion);
         READWRITE(vchPubKey);
     }
-};
-
-
-
-/** 
- * Internal transfers.
- * Database key is acentry<account><counter>.
- */
-class CAccountingEntry
-{
-public:
-    std::string strAccount;
-    CAmount nCreditDebit;
-    int64_t nTime;
-    std::string strOtherAccount;
-    std::string strComment;
-    mapValue_t mapValue;
-    int64_t nOrderPos;  //! position in ordered transaction list
-    uint64_t nEntryNo;
-
-    CAccountingEntry()
-    {
-        SetNull();
-    }
-
-    void SetNull()
-    {
-        nCreditDebit = 0;
-        nTime = 0;
-        strAccount.clear();
-        strOtherAccount.clear();
-        strComment.clear();
-        nOrderPos = -1;
-        nEntryNo = 0;
-    }
-
-    ADD_SERIALIZE_METHODS;
-
-    template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
-        if (!(nType & SER_GETHASH))
-            READWRITE(nVersion);
-        //! Note: strAccount is serialized as part of the key, not here.
-        READWRITE(nCreditDebit);
-        READWRITE(nTime);
-        READWRITE(LIMITED_STRING(strOtherAccount, 65536));
-
-        if (!ser_action.ForRead())
-        {
-            WriteOrderPos(nOrderPos, mapValue);
-
-            if (!(mapValue.empty() && _ssExtra.empty()))
-            {
-                CDataStream ss(nType, nVersion);
-                ss.insert(ss.begin(), '\0');
-                ss << mapValue;
-                ss.insert(ss.end(), _ssExtra.begin(), _ssExtra.end());
-                strComment.append(ss.str());
-            }
-        }
-
-        READWRITE(LIMITED_STRING(strComment, 65536));
-
-        size_t nSepPos = strComment.find("\0", 0, 1);
-        if (ser_action.ForRead())
-        {
-            mapValue.clear();
-            if (std::string::npos != nSepPos)
-            {
-                CDataStream ss(std::vector<char>(strComment.begin() + nSepPos + 1, strComment.end()), nType, nVersion);
-                ss >> mapValue;
-                _ssExtra = std::vector<char>(ss.begin(), ss.end());
-            }
-            ReadOrderPos(nOrderPos, mapValue);
-        }
-        if (std::string::npos != nSepPos)
-            strComment.erase(nSepPos);
-
-        mapValue.erase("n");
-    }
-
-private:
-    std::vector<char> _ssExtra;
 };
 
 #endif // BITCOIN_WALLET_WALLET_H

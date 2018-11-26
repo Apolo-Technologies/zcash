@@ -82,13 +82,15 @@ CBlockIndex* CBlockIndex::GetAncestor(int height)
     while (heightWalk > height) {
         int heightSkip = GetSkipHeight(heightWalk);
         int heightSkipPrev = GetSkipHeight(heightWalk - 1);
-        if (heightSkip == height ||
-            (heightSkip > height && !(heightSkipPrev < heightSkip - 2 &&
-                                      heightSkipPrev >= height))) {
+        if (pindexWalk->pskip != NULL &&
+            (heightSkip == height ||
+             (heightSkip > height && !(heightSkipPrev < heightSkip - 2 &&
+                                       heightSkipPrev >= height)))) {
             // Only follow pskip if pprev->pskip isn't better than pskip->pprev.
             pindexWalk = pindexWalk->pskip;
             heightWalk = heightSkip;
         } else {
+            assert(pindexWalk->pprev);
             pindexWalk = pindexWalk->pprev;
             heightWalk--;
         }

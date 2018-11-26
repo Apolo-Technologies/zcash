@@ -140,7 +140,7 @@ bool static LookupIntern(const char *pszName, std::vector<CNetAddr>& vIP, unsign
         return false;
 
     do {
-        // Should set the timeout limit to a resonable value to avoid
+        // Should set the timeout limit to a reasonable value to avoid
         // generating unnecessary checking call during the polling loop,
         // while it can still response to stop request quick enough.
         // 2 seconds looks fine in our situation.
@@ -227,10 +227,7 @@ bool LookupNumeric(const char *pszName, CService& addr, int portDefault)
     return Lookup(pszName, addr, portDefault, false);
 }
 
-/**
- * Convert milliseconds to a struct timeval for select.
- */
-struct timeval static MillisToTimeval(int64_t nTimeout)
+struct timeval MillisToTimeval(int64_t nTimeout)
 {
     struct timeval timeout;
     timeout.tv_sec  = nTimeout / 1000;
@@ -1338,6 +1335,11 @@ bool operator==(const CSubNet& a, const CSubNet& b)
 bool operator!=(const CSubNet& a, const CSubNet& b)
 {
     return !(a==b);
+}
+
+bool operator<(const CSubNet& a, const CSubNet& b)
+{
+    return (a.network < b.network || (a.network == b.network && memcmp(a.netmask, b.netmask, 16) < 0));
 }
 
 #ifdef WIN32

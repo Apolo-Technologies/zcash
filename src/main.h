@@ -15,6 +15,7 @@
 #include "chainparams.h"
 #include "coins.h"
 #include "consensus/consensus.h"
+#include "consensus/upgrades.h"
 #include "net.h"
 #include "primitives/block.h"
 #include "primitives/transaction.h"
@@ -44,27 +45,31 @@ class CInv;
 class CScriptCheck;
 class CValidationInterface;
 class CValidationState;
+class PrecomputedTransactionData;
 
 struct CNodeStateStats;
 
-// This is a 2-of-3 multisig P2SH
-static const char *FOUNDERS_REWARD_SCRIPT = "a9146708e6670db0b950dac68031025cc5b63213a49187";
-
 /** Default for -blockmaxsize and -blockminsize, which control the range of sizes the mining code will create **/
-static const unsigned int DEFAULT_BLOCK_MAX_SIZE = 750000;
+static const unsigned int DEFAULT_BLOCK_MAX_SIZE = MAX_BLOCK_SIZE;
 static const unsigned int DEFAULT_BLOCK_MIN_SIZE = 0;
 /** Default for -blockprioritysize, maximum space for zero/low-fee transactions **/
-static const unsigned int DEFAULT_BLOCK_PRIORITY_SIZE = 50000;
+static const unsigned int DEFAULT_BLOCK_PRIORITY_SIZE = DEFAULT_BLOCK_MAX_SIZE / 2;
 /** Default for accepting alerts from the P2P network. */
 static const bool DEFAULT_ALERTS = true;
-/** The maximum size for transactions we're willing to relay/mine */
-static const unsigned int MAX_STANDARD_TX_SIZE = 100000;
+/** Minimum alert priority for enabling safe mode. */
+static const int ALERT_PRIORITY_SAFE_MODE = 4000;
+/** Maximum reorg length we will accept before we shut down and alert the user. */
+static const unsigned int MAX_REORG_LENGTH = COINBASE_MATURITY - 1;
 /** Maximum number of signature check operations in an IsStandard() P2SH script */
 static const unsigned int MAX_P2SH_SIGOPS = 15;
 /** The maximum number of sigops we're willing to relay/mine in a single tx */
 static const unsigned int MAX_STANDARD_TX_SIGOPS = MAX_BLOCK_SIGOPS/5;
+/** Default for -minrelaytxfee, minimum relay fee for transactions */
+static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 100;
 /** Default for -maxorphantx, maximum number of orphan transactions kept in memory */
 static const unsigned int DEFAULT_MAX_ORPHAN_TRANSACTIONS = 100;
+/** Default for -txexpirydelta, in number of blocks */
+static const unsigned int DEFAULT_TX_EXPIRY_DELTA = 20;
 /** The maximum size of a blk?????.dat file (since 0.8) */
 static const unsigned int MAX_BLOCKFILE_SIZE = 0x8000000; // 128 MiB
 /** The pre-allocation chunk size for blk?????.dat files (since 0.8) */
@@ -94,6 +99,10 @@ static const unsigned int DATABASE_FLUSH_INTERVAL = 24 * 60 * 60;
 /** Maximum length of reject messages. */
 static const unsigned int MAX_REJECT_MESSAGE_LENGTH = 111;
 
+// Sanity check the magic numbers when we change them
+BOOST_STATIC_ASSERT(DEFAULT_BLOCK_MAX_SIZE <= MAX_BLOCK_SIZE);
+BOOST_STATIC_ASSERT(DEFAULT_BLOCK_PRIORITY_SIZE <= DEFAULT_BLOCK_MAX_SIZE);
+
 #define equihash_parameters_acceptable(N, K) \
     ((CBlockHeader::HEADER_SIZE + equihash_solution_size(N, K))*MAX_HEADERS_RESULTS < \
      MAX_PROTOCOL_MESSAGE_LENGTH-1000)
@@ -103,6 +112,7 @@ struct BlockHasher
     size_t operator()(const uint256& hash) const { return hash.GetCheapHash(); }
 };
 
+extern unsigned int expiryDelta;
 extern CScript COINBASE_FLAGS;
 extern CCriticalSection cs_main;
 extern CTxMemPool mempool;
@@ -113,6 +123,7 @@ extern uint64_t nLastBlockSize;
 extern const std::string strMessageMagic;
 extern CWaitableCriticalSection csBestBlock;
 extern CConditionVariable cvBlockChange;
+extern bool fExperimentalMode;
 extern bool fImporting;
 extern bool fReindex;
 extern int nScriptCheckThreads;
@@ -141,7 +152,7 @@ extern bool fPruneMode;
 /** Number of MiB of block files that we're trying to stay below. */
 extern uint64_t nPruneTarget;
 /** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of chainActive.Tip() will not be pruned. */
-static const signed int MIN_BLOCKS_TO_KEEP = 288;
+static const unsigned int MIN_BLOCKS_TO_KEEP = 288;
 
 // Require that user allocate at least 550MB for block & undo files (blk???.dat and rev???.dat)
 // At 1MB per block, 288 blocks = 288MB.
@@ -151,7 +162,7 @@ static const signed int MIN_BLOCKS_TO_KEEP = 288;
 // full block file chunks, we need the high water mark which triggers the prune to be
 // one 128MB block file + added 15% undo data = 147MB greater for a total of 545MB
 // Setting the target to > than 550MB will make it likely we can respect the target.
-static const signed int MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 * 1024 * 1024;
+static const uint64_t MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 * 1024 * 1024;
 
 /** Register with a network node to receive its signals */
 void RegisterNodeSignals(CNodeSignals& nodeSignals);
@@ -203,7 +214,7 @@ void PartitionCheck(bool (*initialDownloadCheck)(), CCriticalSection& cs, const 
 /** Check whether we are doing an initial block download (synchronizing from disk or network) */
 bool IsInitialBlockDownload();
 /** Format a string that describes several potential problems detected by the core */
-std::string GetWarnings(std::string strFor);
+std::string GetWarnings(const std::string& strFor);
 /** Retrieve a transaction (from memory pool, or from disk, if possible) */
 bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, bool fAllowSlow = false);
 /** Find the best known block, and make it the tip of the block chain */
@@ -262,7 +273,7 @@ struct CDiskTxPos : public CDiskBlockPos
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(*(CDiskBlockPos*)this);
         READWRITE(VARINT(nTxOffset));
     }
@@ -300,7 +311,7 @@ CAmount GetMinRelayFee(const CTransaction& tx, unsigned int nBytes, bool fAllowF
  * @param[in] mapInputs    Map of previous transactions that have outputs we're spending
  * @return True if all inputs (scriptSigs) use only standard transaction forms
  */
-bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs);
+bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs, uint32_t consensusBranchId);
 
 /** 
  * Count ECDSA signature operations the old-fashioned (pre-0.6) way
@@ -325,30 +336,49 @@ unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& ma
  * instead of being performed inline.
  */
 bool ContextualCheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsViewCache &view, bool fScriptChecks,
-                           unsigned int flags, bool cacheStore, const Consensus::Params& consensusParams,
+                           unsigned int flags, bool cacheStore, PrecomputedTransactionData& txdata,
+                           const Consensus::Params& consensusParams, uint32_t consensusBranchId,
                            std::vector<CScriptCheck> *pvChecks = NULL);
 
-bool NonContextualCheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsViewCache &view, bool fScriptChecks,
-                              unsigned int flags, bool cacheStore, const Consensus::Params& consensusParams,
-                              std::vector<CScriptCheck> *pvChecks = NULL);
+/** Check a transaction contextually against a set of consensus rules */
+bool ContextualCheckTransaction(const CTransaction& tx, CValidationState &state, int nHeight, int dosLevel);
 
 /** Apply the effects of this transaction on the UTXO set represented by view */
-void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCache &inputs, int nHeight);
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, int nHeight);
+
+/** Transaction validation functions */
 
 /** Context-independent validity checks */
-bool CheckTransaction(const CTransaction& tx, CValidationState& state);
+bool CheckTransaction(const CTransaction& tx, CValidationState& state, libzcash::ProofVerifier& verifier);
 bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidationState &state);
 
 /** Check for standard transaction types
  * @return True if all outputs (scriptPubKeys) use only standard transaction forms
  */
-bool IsStandardTx(const CTransaction& tx, std::string& reason);
+bool IsStandardTx(const CTransaction& tx, std::string& reason, int nHeight = 0);
+
+namespace Consensus {
+
+/**
+ * Check whether all inputs of this transaction are valid (no double spends and amounts)
+ * This does not modify the UTXO set. This does not check scripts and sigs.
+ * Preconditions: tx.IsCoinBase() is false.
+ */
+bool CheckTxInputs(const CTransaction& tx, CValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, const Consensus::Params& consensusParams);
+
+} // namespace Consensus
 
 /**
  * Check if transaction is final and can be included in a block with the
  * specified height and time. Consensus critical.
  */
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime);
+
+/**
+ * Check if transaction is expired and can be included in a block with the
+ * specified height. Consensus critical.
+ */
+bool IsExpiredTx(const CTransaction &tx, int nBlockHeight);
 
 /**
  * Check if transaction will be final in the next block to be created.
@@ -367,27 +397,33 @@ class CScriptCheck
 {
 private:
     CScript scriptPubKey;
+    CAmount amount;
     const CTransaction *ptxTo;
     unsigned int nIn;
     unsigned int nFlags;
     bool cacheStore;
+    uint32_t consensusBranchId;
     ScriptError error;
+    PrecomputedTransactionData *txdata;
 
 public:
-    CScriptCheck(): ptxTo(0), nIn(0), nFlags(0), cacheStore(false), error(SCRIPT_ERR_UNKNOWN_ERROR) {}
-    CScriptCheck(const CCoins& txFromIn, const CTransaction& txToIn, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn) :
-        scriptPubKey(txFromIn.vout[txToIn.vin[nInIn].prevout.n].scriptPubKey),
-        ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), error(SCRIPT_ERR_UNKNOWN_ERROR) { }
+    CScriptCheck(): amount(0), ptxTo(0), nIn(0), nFlags(0), cacheStore(false), consensusBranchId(0), error(SCRIPT_ERR_UNKNOWN_ERROR) {}
+    CScriptCheck(const CCoins& txFromIn, const CTransaction& txToIn, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, uint32_t consensusBranchIdIn, PrecomputedTransactionData* txdataIn) :
+        scriptPubKey(txFromIn.vout[txToIn.vin[nInIn].prevout.n].scriptPubKey), amount(txFromIn.vout[txToIn.vin[nInIn].prevout.n].nValue),
+        ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), consensusBranchId(consensusBranchIdIn), error(SCRIPT_ERR_UNKNOWN_ERROR), txdata(txdataIn) { }
 
     bool operator()();
 
     void swap(CScriptCheck &check) {
         scriptPubKey.swap(check.scriptPubKey);
         std::swap(ptxTo, check.ptxTo);
+        std::swap(amount, check.amount);
         std::swap(nIn, check.nIn);
         std::swap(nFlags, check.nFlags);
         std::swap(cacheStore, check.cacheStore);
+        std::swap(consensusBranchId, check.consensusBranchId);
         std::swap(error, check.error);
+        std::swap(txdata, check.txdata);
     }
 
     ScriptError GetScriptError() const { return error; }
@@ -413,7 +449,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
 /** Context-independent validity checks */
 bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state, bool fCheckPOW = true);
-bool CheckBlock(const CBlock& block, CValidationState& state, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
+bool CheckBlock(const CBlock& block, CValidationState& state,
+                libzcash::ProofVerifier& verifier,
+                bool fCheckPOW = true, bool fCheckMerkleRoot = true);
 
 /** Context-dependent validity checks */
 bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& state, CBlockIndex *pindexPrev);
@@ -422,11 +460,24 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
 /** Check a block is completely valid from start to finish (only works on top of our current best block, with cs_main held) */
 bool TestBlockValidity(CValidationState &state, const CBlock& block, CBlockIndex *pindexPrev, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
 
-/** Store block on disk. If dbp is non-NULL, the file is known to already reside on disk */
+/**
+ * Store block on disk.
+ * JoinSplit proofs are never verified, because:
+ * - AcceptBlock doesn't perform script checks either.
+ * - The only caller of AcceptBlock verifies JoinSplit proofs elsewhere.
+ * If dbp is non-NULL, the file is known to already reside on disk
+ */
 bool AcceptBlock(CBlock& block, CValidationState& state, CBlockIndex **pindex, bool fRequested, CDiskBlockPos* dbp);
 bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state, CBlockIndex **ppindex= NULL);
 
 
+
+/**
+ * When there are blocks in the active chain with missing data (e.g. if the
+ * activation height and branch ID of a particular upgrade have been altered),
+ * rewind the chainstate and remove them from the block index.
+ */
+bool RewindBlockIndex(const CChainParams& params);
 
 class CBlockFileInfo
 {
@@ -442,7 +493,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         READWRITE(VARINT(nBlocks));
         READWRITE(VARINT(nSize));
         READWRITE(VARINT(nUndoSize));
@@ -499,7 +550,7 @@ bool InvalidateBlock(CValidationState& state, CBlockIndex *pindex);
 /** Remove invalidity status from a block and its descendants. */
 bool ReconsiderBlock(CValidationState& state, CBlockIndex *pindex);
 
-/** The currently-connected chain of blocks. */
+/** The currently-connected chain of blocks (protected by cs_main). */
 extern CChain chainActive;
 
 /** Global variable that points to the active CCoinsView (protected by cs_main) */
@@ -507,5 +558,15 @@ extern CCoinsViewCache *pcoinsTip;
 
 /** Global variable that points to the active block tree (protected by cs_main) */
 extern CBlockTreeDB *pblocktree;
+
+/**
+ * Return the spend height, which is one more than the inputs.GetBestBlock().
+ * While checking, GetBestBlock() refers to the parent block. (protected by cs_main)
+ * This is also true for mempool checks.
+ */
+int GetSpendHeight(const CCoinsViewCache& inputs);
+
+/** Return a CMutableTransaction with contextual default values based on set of consensus rules at height */
+CMutableTransaction CreateNewContextualCMutableTransaction(const Consensus::Params& consensusParams, int nHeight);
 
 #endif // BITCOIN_MAIN_H

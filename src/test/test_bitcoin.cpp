@@ -12,6 +12,7 @@
 #include "main.h"
 #include "random.h"
 #include "txdb.h"
+#include "txmempool.h"
 #include "ui_interface.h"
 #include "util.h"
 #ifdef ENABLE_WALLET
@@ -23,6 +24,8 @@
 #include <boost/test/unit_test.hpp>
 #include <boost/thread.hpp>
 
+#include "librustzcash.h"
+
 CClientUIInterface uiInterface; // Declared but not defined in ui_interface.h
 CWallet* pwalletMain;
 ZCJoinSplit *pzcashParams;
@@ -30,20 +33,44 @@ ZCJoinSplit *pzcashParams;
 extern bool fPrintToConsole;
 extern void noui_connect();
 
+JoinSplitTestingSetup::JoinSplitTestingSetup()
+{
+    boost::filesystem::path pk_path = ZC_GetParamsDir() / "sprout-proving.key";
+    boost::filesystem::path vk_path = ZC_GetParamsDir() / "sprout-verifying.key";
+    pzcashParams = ZCJoinSplit::Prepared(vk_path.string(), pk_path.string());
+
+    boost::filesystem::path sapling_spend = ZC_GetParamsDir() / "sapling-spend-testnet.params";
+    boost::filesystem::path sapling_output = ZC_GetParamsDir() / "sapling-output-testnet.params";
+    boost::filesystem::path sprout_groth16 = ZC_GetParamsDir() / "sprout-groth16-testnet.params";
+
+    std::string sapling_spend_str = sapling_spend.string();
+    std::string sapling_output_str = sapling_output.string();
+    std::string sprout_groth16_str = sprout_groth16.string();
+
+    librustzcash_init_zksnark_params(
+        sapling_spend_str.c_str(),
+        sapling_output_str.c_str(),
+        sprout_groth16_str.c_str()
+    );
+}
+
+JoinSplitTestingSetup::~JoinSplitTestingSetup()
+{
+    delete pzcashParams;
+}
+
 BasicTestingSetup::BasicTestingSetup()
 {
-        assert(init_and_check_sodium() != -1);
-        ECC_Start();
-        pzcashParams = ZCJoinSplit::Unopened();
-        SetupEnvironment();
-        fPrintToDebugLog = false; // don't want to write to debug.log file
-        fCheckBlockIndex = true;
-        SelectParams(CBaseChainParams::MAIN);
+    assert(init_and_check_sodium() != -1);
+    ECC_Start();
+    SetupEnvironment();
+    fPrintToDebugLog = false; // don't want to write to debug.log file
+    fCheckBlockIndex = true;
+    SelectParams(CBaseChainParams::MAIN);
 }
 BasicTestingSetup::~BasicTestingSetup()
 {
-        ECC_Stop();
-        delete pzcashParams;
+    ECC_Stop();
 }
 
 TestingSetup::TestingSetup()
@@ -90,6 +117,13 @@ TestingSetup::~TestingSetup()
         bitdb.Reset();
 #endif
         boost::filesystem::remove_all(pathTemp);
+}
+
+
+CTxMemPoolEntry TestMemPoolEntryHelper::FromTx(CMutableTransaction &tx, CTxMemPool *pool) {
+    return CTxMemPoolEntry(tx, nFee, nTime, dPriority, nHeight,
+                           pool ? pool->HasNoInputsOf(tx) : hadNoDependencies,
+                           spendsCoinbase, nBranchId);
 }
 
 void Shutdown(void* parg)

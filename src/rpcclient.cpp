@@ -11,8 +11,9 @@
 #include <set>
 #include <stdint.h>
 
+#include <univalue.h>
+
 using namespace std;
-using namespace json_spirit;
 
 class CRPCConvertParam
 {
@@ -69,13 +70,16 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "listunspent", 1 },
     { "listunspent", 2 },
     { "getblock", 1 },
+    { "getblockheader", 1 },
     { "gettransaction", 1 },
     { "getrawtransaction", 1 },
     { "createrawtransaction", 0 },
     { "createrawtransaction", 1 },
+    { "createrawtransaction", 2 },
     { "signrawtransaction", 1 },
     { "signrawtransaction", 2 },
     { "sendrawtransaction", 1 },
+    { "fundrawtransaction", 1 },
     { "gettxout", 1 },
     { "gettxout", 2 },
     { "gettxoutproof", 0 },
@@ -91,6 +95,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "estimatepriority", 0 },
     { "prioritisetransaction", 1 },
     { "prioritisetransaction", 2 },
+    { "setban", 2 },
+    { "setban", 3 },
     { "zcrawjoinsplit", 1 },
     { "zcrawjoinsplit", 2 },
     { "zcrawjoinsplit", 3 },
@@ -98,14 +104,31 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "zcbenchmark", 1 },
     { "zcbenchmark", 2 },
     { "getblocksubsidy", 0},
-    { "z_listreceivedbyaddress", 1},    
+    { "z_listaddresses", 0},
+    { "z_listreceivedbyaddress", 1},
+    { "z_listunspent", 0 },
+    { "z_listunspent", 1 },
+    { "z_listunspent", 2 },
+    { "z_listunspent", 3 },
     { "z_getbalance", 1},
     { "z_gettotalbalance", 0},
+    { "z_gettotalbalance", 1},
+    { "z_gettotalbalance", 2},
+    { "z_mergetoaddress", 0},
+    { "z_mergetoaddress", 2},
+    { "z_mergetoaddress", 3},
+    { "z_mergetoaddress", 4},
     { "z_sendmany", 1},
     { "z_sendmany", 2},
+    { "z_sendmany", 3},
+    { "z_shieldcoinbase", 2},
+    { "z_shieldcoinbase", 3},
     { "z_getoperationstatus", 0},
     { "z_getoperationresult", 0},
-    { "z_importkey", 1 }
+    { "z_importkey", 2 },
+    { "z_importviewingkey", 2 },
+    { "z_getpaymentdisclosure", 1},
+    { "z_getpaymentdisclosure", 2}
 };
 
 class CRPCConvertTable
@@ -134,25 +157,32 @@ CRPCConvertTable::CRPCConvertTable()
 
 static CRPCConvertTable rpcCvtTable;
 
-/** Convert strings to command-specific RPC representation */
-Array RPCConvertValues(const std::string &strMethod, const std::vector<std::string> &strParams)
+/** Non-RFC4627 JSON parser, accepts internal values (such as numbers, true, false, null)
+ * as well as objects and arrays.
+ */
+UniValue ParseNonRFCJSONValue(const std::string& strVal)
 {
-    Array params;
+    UniValue jVal;
+    if (!jVal.read(std::string("[")+strVal+std::string("]")) ||
+        !jVal.isArray() || jVal.size()!=1)
+        throw runtime_error(string("Error parsing JSON:")+strVal);
+    return jVal[0];
+}
+
+/** Convert strings to command-specific RPC representation */
+UniValue RPCConvertValues(const std::string &strMethod, const std::vector<std::string> &strParams)
+{
+    UniValue params(UniValue::VARR);
 
     for (unsigned int idx = 0; idx < strParams.size(); idx++) {
         const std::string& strVal = strParams[idx];
 
-        // insert string value directly
         if (!rpcCvtTable.convert(strMethod, idx)) {
+            // insert string value directly
             params.push_back(strVal);
-        }
-
-        // parse string as JSON, insert bool/number/object/etc. value
-        else {
-            Value jVal;
-            if (!read_string(strVal, jVal))
-                throw runtime_error(string("Error parsing JSON:")+strVal);
-            params.push_back(jVal);
+        } else {
+            // parse string as JSON, insert bool/number/object/etc. value
+            params.push_back(ParseNonRFCJSONValue(strVal));
         }
     }
 

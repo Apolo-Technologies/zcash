@@ -7,6 +7,7 @@
 #define BITCOIN_SCRIPT_SCRIPT_H
 
 #include "crypto/common.h"
+#include "prevector.h"
 
 #include <assert.h>
 #include <climits>
@@ -18,6 +19,9 @@
 #include <vector>
 
 static const unsigned int MAX_SCRIPT_ELEMENT_SIZE = 520; // bytes
+
+// Maximum script length in bytes
+static const int MAX_SCRIPT_SIZE = 10000;
 
 // Threshold for nLockTime: below this value it is interpreted as block number,
 // otherwise as UNIX timestamp.
@@ -348,8 +352,10 @@ private:
     int64_t m_value;
 };
 
+typedef prevector<28, unsigned char> CScriptBase;
+
 /** Serialized script, used inside transaction inputs and outputs */
-class CScript : public std::vector<unsigned char>
+class CScript : public CScriptBase
 {
 protected:
     CScript& push_int64(int64_t n)
@@ -370,9 +376,10 @@ protected:
     }
 public:
     CScript() { }
-    CScript(const CScript& b) : std::vector<unsigned char>(b.begin(), b.end()) { }
-    CScript(const_iterator pbegin, const_iterator pend) : std::vector<unsigned char>(pbegin, pend) { }
-    CScript(const unsigned char* pbegin, const unsigned char* pend) : std::vector<unsigned char>(pbegin, pend) { }
+    CScript(const CScript& b) : CScriptBase(b.begin(), b.end()) { }
+    CScript(const_iterator pbegin, const_iterator pend) : CScriptBase(pbegin, pend) { }
+    CScript(std::vector<unsigned char>::const_iterator pbegin, std::vector<unsigned char>::const_iterator pend) : CScriptBase(pbegin, pend) { }
+    CScript(const unsigned char* pbegin, const unsigned char* pend) : CScriptBase(pbegin, pend) { }
 
     CScript& operator+=(const CScript& b)
     {
@@ -543,34 +550,6 @@ public:
         return (opcodetype)(OP_1+n-1);
     }
 
-    int FindAndDelete(const CScript& b)
-    {
-        int nFound = 0;
-        if (b.empty())
-            return nFound;
-        iterator pc = begin();
-        opcodetype opcode;
-        do
-        {
-            while (end() - pc >= (long)b.size() && memcmp(&pc[0], &b[0], b.size()) == 0)
-            {
-                pc = erase(pc, pc + b.size());
-                ++nFound;
-            }
-        }
-        while (GetOp(pc, opcode));
-        return nFound;
-    }
-    int Find(opcodetype op) const
-    {
-        int nFound = 0;
-        opcodetype opcode;
-        for (const_iterator pc = begin(); pc != end() && GetOp(pc, opcode);)
-            if (opcode == op)
-                ++nFound;
-        return nFound;
-    }
-
     /**
      * Pre-version-0.6, Bitcoin always counted CHECKMULTISIGs
      * as 20 sigops. With pay-to-script-hash, that changed:
@@ -598,14 +577,13 @@ public:
      */
     bool IsUnspendable() const
     {
-        return (size() > 0 && *begin() == OP_RETURN);
+        return (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE);
     }
 
-    std::string ToString() const;
     void clear()
     {
         // The default std::vector::clear() does not release memory.
-        std::vector<unsigned char>().swap(*this);
+        CScriptBase().swap(*this);
     }
 };
 

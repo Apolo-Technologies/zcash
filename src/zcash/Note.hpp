@@ -1,5 +1,5 @@
-#ifndef _ZCNOTE_H_
-#define _ZCNOTE_H_
+#ifndef ZC_NOTE_H_
+#define ZC_NOTE_H_
 
 #include "uint256.h"
 #include "Zcash.h"
@@ -26,7 +26,7 @@ public:
 
 class NotePlaintext {
 public:
-    uint64_t value;
+    uint64_t value = 0;
     uint256 rho;
     uint256 r;
     boost::array<unsigned char, ZC_MEMO_SIZE> memo;
@@ -40,7 +40,7 @@ public:
     ADD_SERIALIZE_METHODS;
 
     template <typename Stream, typename Operation>
-    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+    inline void SerializationOp(Stream& s, Operation ser_action) {
         unsigned char leadingByte = 0x00;
         READWRITE(leadingByte);
 
@@ -68,4 +68,4 @@ public:
 
 }
 
-#endif // _ZCNOTE_H_
+#endif // ZC_NOTE_H_

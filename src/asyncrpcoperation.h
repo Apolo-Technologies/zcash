@@ -15,20 +15,16 @@
 #include <utility>
 #include <future>
 
-#include "json/json_spirit_value.h"
-#include "json/json_spirit_utils.h"
-#include "json/json_spirit_reader_template.h"
-#include "json/json_spirit_writer_template.h"
+#include <univalue.h>
 
 using namespace std;
-using namespace json_spirit;
 
 /**
  * AsyncRPCOperation objects are submitted to the AsyncRPCQueue for processing.
  * 
  * To subclass AsyncRPCOperation, implement the main() method.
  * Update the operation status as work is underway and completes.
- * If main() can be interrupted, inmplement the cancel() method.
+ * If main() can be interrupted, implement the cancel() method.
  */
 
 typedef std::string AsyncRPCOperationId;
@@ -66,11 +62,12 @@ public:
         return creation_time_;
     }
 
-    Value getStatus() const;
+    // Override this method to add data to the default status object.
+    virtual UniValue getStatus() const;
 
-    Value getError() const;
+    UniValue getError() const;
     
-    Value getResult() const;
+    UniValue getResult() const;
 
     std::string getStateAsString() const;
     
@@ -113,7 +110,7 @@ protected:
     // internal state.  Currently, all operations are executed in a single-thread
     // by a single worker.
     mutable std::mutex lock_;   // lock on this when read/writing non-atomics
-    Value result_;
+    UniValue result_;
     int error_code_;
     std::string error_message_;
     std::atomic<OperationStatus> state_;
@@ -136,7 +133,7 @@ protected:
         this->error_message_ = errorMessage;
     }
     
-    void set_result(Value v) {
+    void set_result(UniValue v) {
         std::lock_guard<std::mutex> guard(lock_);
         this->result_ = v;
     }

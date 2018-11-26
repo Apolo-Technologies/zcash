@@ -7,7 +7,6 @@
 #define BITCOIN_CHAINPARAMS_H
 
 #include "chainparamsbase.h"
-#include "checkpoints.h"
 #include "consensus/params.h"
 #include "primitives/block.h"
 #include "protocol.h"
@@ -24,6 +23,14 @@ struct SeedSpec6 {
     uint16_t port;
 };
 
+typedef std::map<int, uint256> MapCheckpoints;
+
+struct CCheckpointData {
+    MapCheckpoints mapCheckpoints;
+    int64_t nTimeLastCheckpoint;
+    int64_t nTransactionsLastCheckpoint;
+    double fTransactionsPerDay;
+};
 
 /**
  * CChainParams defines various tweakable parameters of a given instance of the
@@ -44,6 +51,7 @@ public:
 
         ZCPAYMENT_ADDRRESS,
         ZCSPENDING_KEY,
+        ZCVIEWING_KEY,
 
         MAX_BASE58_TYPES
     };
@@ -53,10 +61,7 @@ public:
     const std::vector<unsigned char>& AlertKey() const { return vAlertPubKey; }
     int GetDefaultPort() const { return nDefaultPort; }
 
-    /** Used if GenerateBitcoins is called with a negative number of threads */
-    int DefaultMinerThreads() const { return nMinerThreads; }
     const CBlock& GenesisBlock() const { return genesis; }
-    bool RequireRPCPassword() const { return fRequireRPCPassword; }
     /** Make miner wait to have peers to avoid wasting work */
     bool MiningRequiresPeers() const { return fMiningRequiresPeers; }
     /** Default value for -checkmempool and -checkblockindex argument */
@@ -67,6 +72,7 @@ public:
     int64_t PruneAfterHeight() const { return nPruneAfterHeight; }
     unsigned int EquihashN() const { return nEquihashN; }
     unsigned int EquihashK() const { return nEquihashK; }
+    std::string CurrencyUnits() const { return strCurrencyUnits; }
     /** Make miner stop after a block is found. In RPC, don't return until nGenProcLimit blocks are generated */
     bool MineBlocksOnDemand() const { return fMineBlocksOnDemand; }
     /** In the future use NetworkIDString() for RPC fields */
@@ -76,7 +82,13 @@ public:
     const std::vector<CDNSSeedData>& DNSSeeds() const { return vSeeds; }
     const std::vector<unsigned char>& Base58Prefix(Base58Type type) const { return base58Prefixes[type]; }
     const std::vector<SeedSpec6>& FixedSeeds() const { return vFixedSeeds; }
-    const Checkpoints::CCheckpointData& Checkpoints() const { return checkpointData; }
+    const CCheckpointData& Checkpoints() const { return checkpointData; }
+    /** Return the founder's reward address and script for a given block height */
+    std::string GetFoundersRewardAddressAtHeight(int height) const;
+    CScript GetFoundersRewardScriptAtHeight(int height) const;
+    std::string GetFoundersRewardAddressAtIndex(int i) const;
+    /** Enforce coinbase consensus rule in regtest mode */
+    void SetRegTestCoinbaseMustBeProtected() { consensus.fCoinbaseMustBeProtected = true; }
 protected:
     CChainParams() {}
 
@@ -84,24 +96,24 @@ protected:
     CMessageHeader::MessageStartChars pchMessageStart;
     //! Raw pub key bytes for the broadcast alert signing key.
     std::vector<unsigned char> vAlertPubKey;
-    int nDefaultPort;
-    int nMinerThreads;
-    long nMaxTipAge;
-    uint64_t nPruneAfterHeight;
-    unsigned int nEquihashN;
-    unsigned int nEquihashK;
+    int nDefaultPort = 0;
+    long nMaxTipAge = 0;
+    uint64_t nPruneAfterHeight = 0;
+    unsigned int nEquihashN = 0;
+    unsigned int nEquihashK = 0;
     std::vector<CDNSSeedData> vSeeds;
     std::vector<unsigned char> base58Prefixes[MAX_BASE58_TYPES];
     std::string strNetworkID;
+    std::string strCurrencyUnits;
     CBlock genesis;
     std::vector<SeedSpec6> vFixedSeeds;
-    bool fRequireRPCPassword;
-    bool fMiningRequiresPeers;
-    bool fDefaultConsistencyChecks;
-    bool fRequireStandard;
-    bool fMineBlocksOnDemand;
-    bool fTestnetToBeDeprecatedFieldRPC;
-    Checkpoints::CCheckpointData checkpointData;
+    bool fMiningRequiresPeers = false;
+    bool fDefaultConsistencyChecks = false;
+    bool fRequireStandard = false;
+    bool fMineBlocksOnDemand = false;
+    bool fTestnetToBeDeprecatedFieldRPC = false;
+    CCheckpointData checkpointData;
+    std::vector<std::string> vFoundersRewardAddress;
 };
 
 /**
@@ -121,5 +133,10 @@ void SelectParams(CBaseChainParams::Network network);
  * Returns false if an invalid combination is given.
  */
 bool SelectParamsFromCommandLine();
+
+/**
+ * Allows modifying the network upgrade regtest parameters.
+ */
+void UpdateNetworkUpgradeParameters(Consensus::UpgradeIndex idx, int nActivationHeight);
 
 #endif // BITCOIN_CHAINPARAMS_H

@@ -6,7 +6,10 @@
 #include "data/tx_valid.json.h"
 #include "test/test_bitcoin.h"
 
+#include "init.h"
 #include "clientversion.h"
+#include "checkqueue.h"
+#include "consensus/upgrades.h"
 #include "consensus/validation.h"
 #include "core_io.h"
 #include "key.h"
@@ -14,6 +17,7 @@
 #include "main.h"
 #include "script/script.h"
 #include "script/script_error.h"
+#include "script/sign.h"
 #include "primitives/transaction.h"
 
 #include "sodium.h"
@@ -23,24 +27,26 @@
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include <boost/assign/list_of.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/assign/list_of.hpp>
-#include "json/json_spirit_writer_template.h"
+#include <boost/test/data/test_case.hpp>
+
+#include <univalue.h>
 
 #include "zcash/Note.hpp"
 #include "zcash/Address.hpp"
+#include "zcash/Proof.hpp"
 
 using namespace std;
-using namespace json_spirit;
 
 // In script_tests.cpp
-extern Array read_json(const std::string& jsondata);
+extern UniValue read_json(const std::string& jsondata);
 
 static std::map<string, unsigned int> mapFlagNames = boost::assign::map_list_of
     (string("NONE"), (unsigned int)SCRIPT_VERIFY_NONE)
     (string("P2SH"), (unsigned int)SCRIPT_VERIFY_P2SH)
     (string("STRICTENC"), (unsigned int)SCRIPT_VERIFY_STRICTENC)
-    (string("DERSIG"), (unsigned int)SCRIPT_VERIFY_DERSIG)
     (string("LOW_S"), (unsigned int)SCRIPT_VERIFY_LOW_S)
     (string("SIGPUSHONLY"), (unsigned int)SCRIPT_VERIFY_SIGPUSHONLY)
     (string("MINIMALDATA"), (unsigned int)SCRIPT_VERIFY_MINIMALDATA)
@@ -84,10 +90,12 @@ string FormatScriptFlags(unsigned int flags)
     return ret.substr(0, ret.size() - 1);
 }
 
-BOOST_FIXTURE_TEST_SUITE(transaction_tests, BasicTestingSetup)
+BOOST_FIXTURE_TEST_SUITE(transaction_tests, JoinSplitTestingSetup)
 
 BOOST_AUTO_TEST_CASE(tx_valid)
 {
+    uint32_t consensusBranchId = SPROUT_BRANCH_ID;
+
     // Read tests from test/data/tx_valid.json
     // Format is an array of arrays
     // Inner arrays are either [ "comment" ]
@@ -95,32 +103,33 @@ BOOST_AUTO_TEST_CASE(tx_valid)
     // ... where all scripts are stringified scripts.
     //
     // verifyFlags is a comma separated list of script verification flags to apply, or "NONE"
-    Array tests = read_json(std::string(json_tests::tx_valid, json_tests::tx_valid + sizeof(json_tests::tx_valid)));
+    UniValue tests = read_json(std::string(json_tests::tx_valid, json_tests::tx_valid + sizeof(json_tests::tx_valid)));
+    std::string comment("");
 
+    auto verifier = libzcash::ProofVerifier::Strict();
     ScriptError err;
-    BOOST_FOREACH(Value& tv, tests)
-    {
-        Array test = tv.get_array();
-        string strTest = write_string(tv, false);
-        if (test[0].type() == array_type)
+    for (size_t idx = 0; idx < tests.size(); idx++) {
+        UniValue test = tests[idx];
+        string strTest = test.write();
+        if (test[0].isArray())
         {
-            if (test.size() != 3 || test[1].type() != str_type || test[2].type() != str_type)
+            if (test.size() != 3 || !test[1].isStr() || !test[2].isStr())
             {
-                BOOST_ERROR("Bad test: " << strTest);
+                BOOST_ERROR("Bad test: " << strTest << comment);
                 continue;
             }
 
             map<COutPoint, CScript> mapprevOutScriptPubKeys;
-            Array inputs = test[0].get_array();
+            UniValue inputs = test[0].get_array();
             bool fValid = true;
-            BOOST_FOREACH(Value& input, inputs)
-            {
-                if (input.type() != array_type)
+            for (size_t inpIdx = 0; inpIdx < inputs.size(); inpIdx++) {
+	        const UniValue& input = inputs[inpIdx];
+                if (!input.isArray())
                 {
                     fValid = false;
                     break;
                 }
-                Array vinput = input.get_array();
+                UniValue vinput = input.get_array();
                 if (vinput.size() != 3)
                 {
                     fValid = false;
@@ -131,7 +140,7 @@ BOOST_AUTO_TEST_CASE(tx_valid)
             }
             if (!fValid)
             {
-                BOOST_ERROR("Bad test: " << strTest);
+                BOOST_ERROR("Bad test: " << strTest << comment);
                 continue;
             }
 
@@ -141,29 +150,40 @@ BOOST_AUTO_TEST_CASE(tx_valid)
             stream >> tx;
 
             CValidationState state;
-            BOOST_CHECK_MESSAGE(CheckTransaction(tx, state), strTest);
-            BOOST_CHECK(state.IsValid());
+            BOOST_CHECK_MESSAGE(CheckTransaction(tx, state, verifier), strTest + comment);
+            BOOST_CHECK_MESSAGE(state.IsValid(), comment);
 
+            PrecomputedTransactionData txdata(tx);
             for (unsigned int i = 0; i < tx.vin.size(); i++)
             {
                 if (!mapprevOutScriptPubKeys.count(tx.vin[i].prevout))
                 {
-                    BOOST_ERROR("Bad test: " << strTest);
+                    BOOST_ERROR("Bad test: " << strTest << comment);
                     break;
                 }
 
+                CAmount amount = 0;
                 unsigned int verify_flags = ParseScriptFlags(test[2].get_str());
                 BOOST_CHECK_MESSAGE(VerifyScript(tx.vin[i].scriptSig, mapprevOutScriptPubKeys[tx.vin[i].prevout],
-                                                 verify_flags, TransactionSignatureChecker(&tx, i), &err),
-                                    strTest);
-                BOOST_CHECK_MESSAGE(err == SCRIPT_ERR_OK, ScriptErrorString(err));
+                                                 verify_flags, TransactionSignatureChecker(&tx, i, amount, txdata), consensusBranchId, &err),
+                                    strTest + comment);
+                BOOST_CHECK_MESSAGE(err == SCRIPT_ERR_OK, ScriptErrorString(err) + comment);
             }
+
+            comment = "";
+        }
+        else if (test.size() == 1)
+        {
+            comment += "\n# ";
+            comment += test[0].write();
         }
     }
 }
 
 BOOST_AUTO_TEST_CASE(tx_invalid)
 {
+    uint32_t consensusBranchId = SPROUT_BRANCH_ID;
+
     // Read tests from test/data/tx_invalid.json
     // Format is an array of arrays
     // Inner arrays are either [ "comment" ]
@@ -171,32 +191,33 @@ BOOST_AUTO_TEST_CASE(tx_invalid)
     // ... where all scripts are stringified scripts.
     //
     // verifyFlags is a comma separated list of script verification flags to apply, or "NONE"
-    Array tests = read_json(std::string(json_tests::tx_invalid, json_tests::tx_invalid + sizeof(json_tests::tx_invalid)));
+    UniValue tests = read_json(std::string(json_tests::tx_invalid, json_tests::tx_invalid + sizeof(json_tests::tx_invalid)));
+    std::string comment("");
 
+    auto verifier = libzcash::ProofVerifier::Strict();
     ScriptError err;
-    BOOST_FOREACH(Value& tv, tests)
-    {
-        Array test = tv.get_array();
-        string strTest = write_string(tv, false);
-        if (test[0].type() == array_type)
+    for (size_t idx = 0; idx < tests.size(); idx++) {
+        UniValue test = tests[idx];
+        string strTest = test.write();
+        if (test[0].isArray())
         {
-            if (test.size() != 3 || test[1].type() != str_type || test[2].type() != str_type)
+            if (test.size() != 3 || !test[1].isStr() || !test[2].isStr())
             {
-                BOOST_ERROR("Bad test: " << strTest);
+                BOOST_ERROR("Bad test: " << strTest << comment);
                 continue;
             }
 
             map<COutPoint, CScript> mapprevOutScriptPubKeys;
-            Array inputs = test[0].get_array();
+            UniValue inputs = test[0].get_array();
             bool fValid = true;
-            BOOST_FOREACH(Value& input, inputs)
-            {
-                if (input.type() != array_type)
+	    for (size_t inpIdx = 0; inpIdx < inputs.size(); inpIdx++) {
+	        const UniValue& input = inputs[inpIdx];
+                if (!input.isArray())
                 {
                     fValid = false;
                     break;
                 }
-                Array vinput = input.get_array();
+                UniValue vinput = input.get_array();
                 if (vinput.size() != 3)
                 {
                     fValid = false;
@@ -207,7 +228,7 @@ BOOST_AUTO_TEST_CASE(tx_invalid)
             }
             if (!fValid)
             {
-                BOOST_ERROR("Bad test: " << strTest);
+                BOOST_ERROR("Bad test: " << strTest << comment);
                 continue;
             }
 
@@ -217,22 +238,31 @@ BOOST_AUTO_TEST_CASE(tx_invalid)
             stream >> tx;
 
             CValidationState state;
-            fValid = CheckTransaction(tx, state) && state.IsValid();
+            fValid = CheckTransaction(tx, state, verifier) && state.IsValid();
 
+            PrecomputedTransactionData txdata(tx);
             for (unsigned int i = 0; i < tx.vin.size() && fValid; i++)
             {
                 if (!mapprevOutScriptPubKeys.count(tx.vin[i].prevout))
                 {
-                    BOOST_ERROR("Bad test: " << strTest);
+                    BOOST_ERROR("Bad test: " << strTest << comment);
                     break;
                 }
 
                 unsigned int verify_flags = ParseScriptFlags(test[2].get_str());
+                CAmount amount = 0;
                 fValid = VerifyScript(tx.vin[i].scriptSig, mapprevOutScriptPubKeys[tx.vin[i].prevout],
-                                      verify_flags, TransactionSignatureChecker(&tx, i), &err);
+                                      verify_flags, TransactionSignatureChecker(&tx, i, amount, txdata), consensusBranchId, &err);
             }
-            BOOST_CHECK_MESSAGE(!fValid, strTest);
-            BOOST_CHECK_MESSAGE(err != SCRIPT_ERR_OK, ScriptErrorString(err));
+            BOOST_CHECK_MESSAGE(!fValid, strTest + comment);
+            BOOST_CHECK_MESSAGE(err != SCRIPT_ERR_OK, ScriptErrorString(err) + comment);
+
+            comment = "";
+        }
+        else if (test.size() == 1)
+        {
+            comment += "\n# ";
+            comment += test[0].write();
         }
     }
 }
@@ -246,11 +276,12 @@ BOOST_AUTO_TEST_CASE(basic_transaction_tests)
     CMutableTransaction tx;
     stream >> tx;
     CValidationState state;
-    BOOST_CHECK_MESSAGE(CheckTransaction(tx, state) && state.IsValid(), "Simple deserialized transaction should be valid.");
+    auto verifier = libzcash::ProofVerifier::Strict();
+    BOOST_CHECK_MESSAGE(CheckTransaction(tx, state, verifier) && state.IsValid(), "Simple deserialized transaction should be valid.");
 
     // Check that duplicate txins fail
     tx.vin.push_back(tx.vin[0]);
-    BOOST_CHECK_MESSAGE(!CheckTransaction(tx, state) || !state.IsValid(), "Transaction with duplicate txins should be invalid.");
+    BOOST_CHECK_MESSAGE(!CheckTransaction(tx, state, verifier) || !state.IsValid(), "Transaction with duplicate txins should be invalid.");
 }
 
 //
@@ -308,9 +339,6 @@ BOOST_AUTO_TEST_CASE(test_basic_joinsplit_verification)
     // Also, it's generally libzcash's job to ensure the
     // integrity of the scheme through its own tests.
 
-    // construct the r1cs keypair
-    auto p = ZCJoinSplit::Generate();
-
     // construct a merkle tree
     ZCIncrementalMerkleTree merkleTree;
 
@@ -341,9 +369,11 @@ BOOST_AUTO_TEST_CASE(test_basic_joinsplit_verification)
         libzcash::JSOutput(addr, 50)
     };
 
+    auto verifier = libzcash::ProofVerifier::Strict();
+
     {
-        JSDescription jsdesc(*p, pubKeyHash, rt, inputs, outputs, 0, 0);
-        BOOST_CHECK(jsdesc.Verify(*p, pubKeyHash));
+        JSDescription jsdesc(*pzcashParams, pubKeyHash, rt, inputs, outputs, 0, 0);
+        BOOST_CHECK(jsdesc.Verify(*pzcashParams, verifier, pubKeyHash));
 
         CDataStream ss(SER_DISK, CLIENT_VERSION);
         ss << jsdesc;
@@ -352,29 +382,26 @@ BOOST_AUTO_TEST_CASE(test_basic_joinsplit_verification)
         ss >> jsdesc_deserialized;
 
         BOOST_CHECK(jsdesc_deserialized == jsdesc);
-        BOOST_CHECK(jsdesc_deserialized.Verify(*p, pubKeyHash));
+        BOOST_CHECK(jsdesc_deserialized.Verify(*pzcashParams, verifier, pubKeyHash));
     }
 
     {
         // Ensure that the balance equation is working.
-        BOOST_CHECK_THROW(JSDescription(*p, pubKeyHash, rt, inputs, outputs, 10, 0), std::invalid_argument);
-        BOOST_CHECK_THROW(JSDescription(*p, pubKeyHash, rt, inputs, outputs, 0, 10), std::invalid_argument);
+        BOOST_CHECK_THROW(JSDescription(*pzcashParams, pubKeyHash, rt, inputs, outputs, 10, 0), std::invalid_argument);
+        BOOST_CHECK_THROW(JSDescription(*pzcashParams, pubKeyHash, rt, inputs, outputs, 0, 10), std::invalid_argument);
     }
 
     {
         // Ensure that it won't verify if the root is changed.
-        auto test = JSDescription(*p, pubKeyHash, rt, inputs, outputs, 0, 0);
+        auto test = JSDescription(*pzcashParams, pubKeyHash, rt, inputs, outputs, 0, 0);
         test.anchor = GetRandHash();
-        BOOST_CHECK(!test.Verify(*p, pubKeyHash));
+        BOOST_CHECK(!test.Verify(*pzcashParams, verifier, pubKeyHash));
     }
-
-    delete p;
 }
 
-BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity)
+void test_simple_joinsplit_invalidity(uint32_t consensusBranchId, CMutableTransaction tx)
 {
-    CMutableTransaction tx;
-    tx.nVersion = 2;
+    auto verifier = libzcash::ProofVerifier::Strict();
     {
         // Ensure that empty vin/vout remain invalid without
         // joinsplits.
@@ -399,13 +426,14 @@ BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity)
         jsdesc->nullifiers[0] = GetRandHash();
         jsdesc->nullifiers[1] = GetRandHash();
 
-        BOOST_CHECK(!CheckTransactionWithoutProofVerification(newTx, state));
+        BOOST_CHECK(CheckTransactionWithoutProofVerification(newTx, state));
+        BOOST_CHECK(!ContextualCheckTransaction(newTx, state, 0, 100));
         BOOST_CHECK(state.GetRejectReason() == "bad-txns-invalid-joinsplit-signature");
 
         // Empty output script.
         CScript scriptCode;
         CTransaction signTx(newTx);
-        uint256 dataToBeSigned = SignatureHash(scriptCode, signTx, NOT_AN_INPUT, SIGHASH_ALL);
+        uint256 dataToBeSigned = SignatureHash(scriptCode, signTx, NOT_AN_INPUT, SIGHASH_ALL, 0, consensusBranchId);
 
         assert(crypto_sign_detached(&newTx.joinSplitSig[0], NULL,
                                     dataToBeSigned.begin(), 32,
@@ -413,6 +441,7 @@ BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity)
                                     ) == 0);
 
         BOOST_CHECK(CheckTransactionWithoutProofVerification(newTx, state));
+        BOOST_CHECK(ContextualCheckTransaction(newTx, state, 0, 100));
     }
     {
         // Ensure that values within the joinsplit are well-formed.
@@ -424,23 +453,23 @@ BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity)
         JSDescription *jsdesc = &newTx.vjoinsplit[0];
         jsdesc->vpub_old = -1;
 
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-txns-vpub_old-negative");
 
         jsdesc->vpub_old = MAX_MONEY + 1;
 
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-txns-vpub_old-toolarge");
 
         jsdesc->vpub_old = 0;
         jsdesc->vpub_new = -1;
 
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-txns-vpub_new-negative");
 
         jsdesc->vpub_new = MAX_MONEY + 1;
 
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-txns-vpub_new-toolarge");
 
         jsdesc->vpub_new = (MAX_MONEY / 2) + 10;
@@ -450,7 +479,7 @@ BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity)
         JSDescription *jsdesc2 = &newTx.vjoinsplit[1];
         jsdesc2->vpub_new = (MAX_MONEY / 2) + 10;
 
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-txns-txintotal-toolarge");
     }
     {
@@ -464,18 +493,19 @@ BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity)
         jsdesc->nullifiers[0] = GetRandHash();
         jsdesc->nullifiers[1] = jsdesc->nullifiers[0];
 
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-joinsplits-nullifiers-duplicate");
 
         jsdesc->nullifiers[1] = GetRandHash();
 
         newTx.vjoinsplit.push_back(JSDescription());
+        jsdesc = &newTx.vjoinsplit[0]; // Fixes #2026. Related PR #2078.
         JSDescription *jsdesc2 = &newTx.vjoinsplit[1];
 
         jsdesc2->nullifiers[0] = GetRandHash();
         jsdesc2->nullifiers[1] = jsdesc->nullifiers[0];
 
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-joinsplits-nullifiers-duplicate");
     }
     {
@@ -494,13 +524,40 @@ BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity)
             CTransaction finalNewTx(newTx);
             BOOST_CHECK(finalNewTx.IsCoinBase());
         }
-        BOOST_CHECK(!CheckTransaction(newTx, state));
+        BOOST_CHECK(!CheckTransaction(newTx, state, verifier));
         BOOST_CHECK(state.GetRejectReason() == "bad-cb-has-joinsplits");
     }
 }
 
-BOOST_AUTO_TEST_CASE(test_Get)
+BOOST_AUTO_TEST_CASE(test_simple_joinsplit_invalidity_driver) {
+    {
+        CMutableTransaction mtx;
+        mtx.nVersion = 2;
+        test_simple_joinsplit_invalidity(SPROUT_BRANCH_ID, mtx);
+    }
+    {
+        // Switch to regtest parameters so we can activate Overwinter
+        SelectParams(CBaseChainParams::REGTEST);
+
+        CMutableTransaction mtx;
+        mtx.fOverwintered = true;
+        mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+        mtx.nVersion = OVERWINTER_TX_VERSION;
+
+        UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::ALWAYS_ACTIVE);
+        test_simple_joinsplit_invalidity(NetworkUpgradeInfo[Consensus::UPGRADE_OVERWINTER].nBranchId, mtx);
+        UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
+
+        // Switch back to mainnet parameters as originally selected in test fixture
+        SelectParams(CBaseChainParams::MAIN);
+    }
+}
+
+// Parameterized testing over consensus branch ids
+BOOST_DATA_TEST_CASE(test_Get, boost::unit_test::data::xrange(static_cast<int>(Consensus::MAX_NETWORK_UPGRADES)))
 {
+    uint32_t consensusBranchId = NetworkUpgradeInfo[sample].nBranchId;
+
     CBasicKeyStore keystore;
     CCoinsView coinsDummy;
     CCoinsViewCache coins(&coinsDummy);
@@ -521,16 +578,99 @@ BOOST_AUTO_TEST_CASE(test_Get)
     t1.vout[0].nValue = 90*CENT;
     t1.vout[0].scriptPubKey << OP_1;
 
-    BOOST_CHECK(AreInputsStandard(t1, coins));
+    BOOST_CHECK(AreInputsStandard(t1, coins, consensusBranchId));
     BOOST_CHECK_EQUAL(coins.GetValueIn(t1), (50+21+22)*CENT);
 
     // Adding extra junk to the scriptSig should make it non-standard:
     t1.vin[0].scriptSig << OP_11;
-    BOOST_CHECK(!AreInputsStandard(t1, coins));
+    BOOST_CHECK(!AreInputsStandard(t1, coins, consensusBranchId));
 
     // ... as should not having enough:
     t1.vin[0].scriptSig = CScript();
-    BOOST_CHECK(!AreInputsStandard(t1, coins));
+    BOOST_CHECK(!AreInputsStandard(t1, coins, consensusBranchId));
+}
+
+BOOST_AUTO_TEST_CASE(test_big_overwinter_transaction) {
+    uint32_t consensusBranchId = NetworkUpgradeInfo[Consensus::UPGRADE_OVERWINTER].nBranchId;
+    CMutableTransaction mtx;
+    mtx.fOverwintered = true;
+    mtx.nVersion = OVERWINTER_TX_VERSION;
+    mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+
+    CKey key;
+    key.MakeNewKey(false);
+    CBasicKeyStore keystore;
+    keystore.AddKeyPubKey(key, key.GetPubKey());
+    CKeyID hash = key.GetPubKey().GetID();
+    CScript scriptPubKey = GetScriptForDestination(hash);
+
+    vector<int> sigHashes;
+    sigHashes.push_back(SIGHASH_NONE | SIGHASH_ANYONECANPAY);
+    sigHashes.push_back(SIGHASH_SINGLE | SIGHASH_ANYONECANPAY);
+    sigHashes.push_back(SIGHASH_ALL | SIGHASH_ANYONECANPAY);
+    sigHashes.push_back(SIGHASH_NONE);
+    sigHashes.push_back(SIGHASH_SINGLE);
+    sigHashes.push_back(SIGHASH_ALL);
+
+    // create a big transaction of 4500 inputs signed by the same key
+    for(uint32_t ij = 0; ij < 4500; ij++) {
+        uint32_t i = mtx.vin.size();
+        uint256 prevId;
+        prevId.SetHex("0000000000000000000000000000000000000000000000000000000000000100");
+        COutPoint outpoint(prevId, i);
+
+        mtx.vin.resize(mtx.vin.size() + 1);
+        mtx.vin[i].prevout = outpoint;
+        mtx.vin[i].scriptSig = CScript();
+
+        mtx.vout.resize(mtx.vout.size() + 1);
+        mtx.vout[i].nValue = 1000;
+        mtx.vout[i].scriptPubKey = CScript() << OP_1;
+    }
+
+    // sign all inputs
+    for(uint32_t i = 0; i < mtx.vin.size(); i++) {
+        bool hashSigned = SignSignature(keystore, scriptPubKey, mtx, i, 1000, sigHashes.at(i % sigHashes.size()), consensusBranchId);
+        assert(hashSigned);
+    }
+
+    CTransaction tx;
+    CDataStream ssout(SER_NETWORK, PROTOCOL_VERSION);
+    ssout << mtx;
+    ssout >> tx;
+
+    // check all inputs concurrently, with the cache
+    PrecomputedTransactionData txdata(tx);
+    boost::thread_group threadGroup;
+    CCheckQueue<CScriptCheck> scriptcheckqueue(128);
+    CCheckQueueControl<CScriptCheck> control(&scriptcheckqueue);
+
+    for (int i=0; i<20; i++)
+        threadGroup.create_thread(boost::bind(&CCheckQueue<CScriptCheck>::Thread, boost::ref(scriptcheckqueue)));
+
+    CCoins coins;
+    coins.nVersion = 1;
+    coins.fCoinBase = false;
+    for(uint32_t i = 0; i < mtx.vin.size(); i++) {
+        CTxOut txout;
+        txout.nValue = 1000;
+        txout.scriptPubKey = scriptPubKey;
+        coins.vout.push_back(txout);
+    }
+
+    for(uint32_t i = 0; i < mtx.vin.size(); i++) {
+        std::vector<CScriptCheck> vChecks;
+        CScriptCheck check(coins, tx, i, SCRIPT_VERIFY_P2SH, false, consensusBranchId, &txdata);
+        vChecks.push_back(CScriptCheck());
+        check.swap(vChecks.back());
+        control.Add(vChecks);
+    }
+
+    bool controlCheck = control.Wait();
+    assert(controlCheck);
+
+    threadGroup.interrupt_all();
+    threadGroup.join_all();
 }
 
 BOOST_AUTO_TEST_CASE(test_IsStandard)
@@ -555,7 +695,7 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
     string reason;
     BOOST_CHECK(IsStandardTx(t, reason));
 
-    t.vout[0].nValue = 501; // dust
+    t.vout[0].nValue = 53; // dust
     BOOST_CHECK(!IsStandardTx(t, reason));
 
     t.vout[0].nValue = 2730; // not dust
@@ -589,6 +729,57 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
 
     t.vout[0].scriptPubKey = CScript() << OP_RETURN;
     t.vout[1].scriptPubKey = CScript() << OP_RETURN;
+    BOOST_CHECK(!IsStandardTx(t, reason));
+}
+
+BOOST_AUTO_TEST_CASE(test_IsStandardV2)
+{
+    LOCK(cs_main);
+    CBasicKeyStore keystore;
+    CCoinsView coinsDummy;
+    CCoinsViewCache coins(&coinsDummy);
+    std::vector<CMutableTransaction> dummyTransactions = SetupDummyInputs(keystore, coins);
+
+    CMutableTransaction t;
+    t.vin.resize(1);
+    t.vin[0].prevout.hash = dummyTransactions[0].GetHash();
+    t.vin[0].prevout.n = 1;
+    t.vin[0].scriptSig << std::vector<unsigned char>(65, 0);
+    t.vout.resize(1);
+    t.vout[0].nValue = 90*CENT;
+    CKey key;
+    key.MakeNewKey(true);
+    t.vout[0].scriptPubKey = GetScriptForDestination(key.GetPubKey().GetID());
+
+    string reason;
+    // A v2 transaction with no JoinSplits is still standard.
+    t.nVersion = 2;
+    BOOST_CHECK(IsStandardTx(t, reason));
+
+    // ... and with one JoinSplit.
+    t.vjoinsplit.push_back(JSDescription());
+    BOOST_CHECK(IsStandardTx(t, reason));
+
+    // ... and when that JoinSplit takes from a transparent input.
+    JSDescription *jsdesc = &t.vjoinsplit[0];
+    jsdesc->vpub_old = 10*CENT;
+    t.vout[0].nValue -= 10*CENT;
+    BOOST_CHECK(IsStandardTx(t, reason));
+
+    // A v2 transaction with JoinSplits but no transparent inputs is standard.
+    jsdesc->vpub_old = 0;
+    jsdesc->vpub_new = 100*CENT;
+    t.vout[0].nValue = 90*CENT;
+    t.vin.resize(0);
+    BOOST_CHECK(IsStandardTx(t, reason));
+
+    // v2 transactions can still be non-standard for the same reasons as v1.
+    t.vout[0].nValue = 53; // dust
+    BOOST_CHECK(!IsStandardTx(t, reason));
+
+    // v3 is not standard.
+    t.nVersion = 3;
+    t.vout[0].nValue = 90*CENT;
     BOOST_CHECK(!IsStandardTx(t, reason));
 }
 

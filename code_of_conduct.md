@@ -46,14 +46,14 @@ You may send reports to [our Conduct email](mailto:conduct@z.cash).
 If you wish to contact specific maintainers directly, the following have made
 themselves available for conduct issues:
 
-- Daira Hopwood (daira at leastauthority.com)
+- Daira Hopwood (daira at z.cash)
 - Sean Bowe (sean at z.cash)
 
 
 This Code of Conduct is adapted from the [Contributor Covenant][homepage],
 version 1.3.0, available at
-[http://contributor-covenant.org/version/1/3/0/][version]
+[https://www.contributor-covenant.org/version/1/3/0/][version]
 
-[homepage]: http://contributor-covenant.org
-[version]: http://contributor-covenant.org/version/1/3/0/
+[homepage]: https://www.contributor-covenant.org
+[version]: https://www.contributor-covenant.org/version/1/3/0/
 
